@@ -50,7 +50,7 @@ describe('migrations', () => {
 
   it('são reversíveis: down deixa o schema limpo e up recria tudo', async () => {
     const down = await orm.migrator.down({ to: 0 });
-    expect(down.length).toBe(4);
+    expect(down.length).toBe(5);
     const tables = await db().execute(
       `select table_name from information_schema.tables
         where table_schema = 'public' and table_name <> 'mikro_orm_migrations'`,
@@ -62,7 +62,7 @@ describe('migrations', () => {
     expect(functions.length).toBe(0);
 
     const up = await orm.migrator.up();
-    expect(up.length).toBe(4);
+    expect(up.length).toBe(5);
     const pending = await orm.migrator.getPending();
     expect(pending.length).toBe(0);
   });
@@ -93,7 +93,9 @@ describe('wallets', () => {
          values (?, 'p', 'brl', 0, 1, now(), now())`,
         [uuid()],
       ),
-    ).rejects.toThrow(/wallets_currency_format/);
+      // A migration 5 restringe a moeda à lista suportada pelo domínio.
+      // Por isso, o banco agora identifica a violação como currency_supported.
+    ).rejects.toThrow(/wallets_currency_supported/);
     await expect(
       db().execute(
         `insert into wallets (id, player_id, currency, balance, version, created_at, updated_at)
@@ -343,6 +345,45 @@ describe('wager_transactions', () => {
 });
 
 describe('wallet_ledger_entries', () => {
+    it('rejeita ROLLBACK com a mesma direção da transação referenciada', async () => {
+    const wallet = await createWallet(orm, { balance: '100.00' });
+
+    // Cria um BET válido: saldo 100 -> 20, version 1 -> 2,
+    // e grava corretamente a transação e o lançamento DEBIT.
+    const bet = await moveFunds(orm, wallet.id, {
+      kind: 'BET',
+      direction: 'DEBIT',
+      amount: '80.00',
+      externalId: `bet-${uuid()}`,
+    });
+
+    const rollbackId = await insertTransaction(db(), {
+      walletId: wallet.id,
+      playerId: 'player-1',
+      kind: 'ROLLBACK',
+      amount: '80.00',
+      currency: 'BRL',
+      externalId: `rollback-${uuid()}`,
+      referenceExternalId: bet.externalId,
+      referenceTransactionId: bet.transactionId,
+    });
+
+    // O BET original foi DEBIT. Um ROLLBACK correto deveria ser CREDIT.
+    // A tentativa abaixo usa DEBIT novamente e deve ser bloqueada pelo trigger.
+    await expect(
+      insertLedgerEntry(db(), {
+        walletId: wallet.id,
+        transactionId: rollbackId,
+        walletVersion: 3,
+        direction: 'DEBIT',
+        amount: '80.00',
+        balanceBefore: '20.00',
+        balanceAfter: '0.00',
+        currency: 'BRL',
+      }),
+    ).rejects.toThrow(/ROLLBACK direction must be opposite/);
+  });
+  
   it('fluxo válido: BET de 80 na wallet de 100 deixa 20 e um único débito, e o ledger fecha com a wallet', async () => {
     const wallet = await createWallet(orm, { balance: '100.00' });
     const bet = await moveFunds(orm, wallet.id, { kind: 'BET', direction: 'DEBIT', amount: '80.00' });
