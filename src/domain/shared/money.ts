@@ -6,7 +6,21 @@ export interface MoneyProps {
 }
 
 const AMOUNT_PATTERN = /^(0|[1-9]\d{0,16})(\.\d{1,2})?$/;
-const CURRENCY_PATTERN = /^[A-Z]{3}$/;
+export const SUPPORTED_CURRENCIES = [
+  'ARS',
+  'AUD',
+  'BRL',
+  'CAD',
+  'CHF',
+  'EUR',
+  'GBP',
+  'MXN',
+  'USD',
+] as const;
+
+export type SupportedCurrency = (typeof SUPPORTED_CURRENCIES)[number];
+
+const SUPPORTED_CURRENCY_SET = new Set<string>(SUPPORTED_CURRENCIES);
 
 export class Money {
     // valor em centavos guardado em bigint pra evitar problema de precisao com float e number.
@@ -97,8 +111,10 @@ export class Money {
     }
 
     private static assertValidCurrency(currency: unknown): asserts currency is string {
-        if (typeof currency !== 'string' || !CURRENCY_PATTERN.test(currency)) {
-            throw new InvalidMoneyError('currency must be a 3-letter uppercase ISO-4217 code');
+        if (typeof currency !== 'string' || !SUPPORTED_CURRENCY_SET.has(currency)) {
+            throw new InvalidMoneyError(
+                                        `currency must be one of: ${SUPPORTED_CURRENCIES.join(', ')}`,
+);
         }
     }
 }
