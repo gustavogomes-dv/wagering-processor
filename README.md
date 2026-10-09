@@ -1,5 +1,7 @@
 # Wagering Processor
 
+![Macaco puxando a alavanca da máquina de apostas](docs/wagering-slot.gif)
+
 Serviço backend para processar operações de carteira usadas em apostas. O sistema valida a operação, altera o saldo com segurança, registra a movimentação no histórico e publica um evento para outros serviços.
 
 ## Garantias principais
