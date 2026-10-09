@@ -1,40 +1,42 @@
-# Decisões de arquitetura
+# Como o sistema foi organizado
 
-## Dinheiro e persistência
+## Visão geral
 
-`Money` guarda centavos em `bigint`; JSON e SQL trafegam decimais como texto/`NUMERIC`, nunca como `number` para cálculo financeiro. Wallet, transação, ledger, inbox e outbox têm migrations versionadas. Constraints e triggers no PostgreSQL protegem valores, unicidade, imutabilidade e consistência no commit.
+O sistema recebe comandos de aposta pela fila `wager-transactions.fifo` ou pela API HTTP. O caso de uso valida a operação, trava a carteira durante a alteração e grava em PostgreSQL a transação, o novo saldo, o lançamento do ledger, a inbox (quando veio do SQS) e o evento da outbox. Tudo acontece na mesma transação. Se uma etapa falhar, o banco desfaz todas.
 
-O MikroORM executa SQL parametrizado dentro de `EntityManager.transactional()`. O domínio permanece independente do ORM. Repositórios traduzem linhas para objetos e vice-versa.
+## Domínio e aplicação
 
-## Concorrência e idempotência
+As regras de dinheiro ficam em `src/domain`. A classe `Money` trabalha com centavos e não usa `number` para calcular valores financeiros. `Wallet`, `WagerTransaction` e `WalletLedgerEntry` validam as regras do negócio.
 
-O use case adquire `SELECT ... FOR UPDATE` somente na wallet da operação. Wallets diferentes continuam processando em paralelo. A atualização também compara a versão lida, e o banco exige que saldo e ledger terminem na mesma versão.
+A aplicação conversa com interfaces chamadas portas. Os adaptadores em `src/infra/persistence/postgres` transformam essas interfaces em SQL. Assim, as regras não ficam presas ao PostgreSQL ou ao ORM.
 
-`Idempotency-Key` é única no PostgreSQL. A API calcula SHA-256 sobre os campos de negócio numa ordem estável; header e metadados de transporte ficam fora do hash. Repetição com o mesmo hash retorna o resultado salvo; chave com payload diferente vira conflito. O replay usa o saldo observado da operação original.
+## Concorrência
 
-O consumidor SQS grava `(consumer_name, message_id)` na inbox dentro da mesma transação financeira. A mensagem só é apagada da fila depois do commit. Redelivery não reaplica a movimentação.
+Duas apostas podem chegar ao mesmo tempo. O processamento usa `SELECT FOR UPDATE` na carteira, então apenas uma operação altera aquela carteira por vez. Carteiras diferentes continuam processando em paralelo. A coluna de versão e as constraints do PostgreSQL também impedem saldo negativo, lançamentos inválidos, moedas incompatíveis e alterações no ledger.
 
-## Referências fora de ordem
+## Idempotência
 
-Operação que depende de referência ausente fica em `PENDING_REFERENCE`; o evento correspondente entra na outbox. Um worker reserva linhas com `FOR UPDATE SKIP LOCKED` e lease curto, sem bloquear a mesma linha em duas instâncias. O intervalo cresce exponencialmente de 1, 2, 4, 8 até 16 segundos. Na quinta tentativa sem resolução, a operação termina como `REJECTED / REFERENCE_NOT_FOUND`.
+A chave de idempotência é única no banco. O sistema calcula um SHA-256 dos dados da operação. A mesma chave com o mesmo conteúdo devolve o resultado salvo sem debitar novamente. A mesma chave com conteúdo diferente gera conflito.
 
-## Eventos e recuperação
+## Inbox, outbox e filas
 
-O status financeiro, saldo, ledger, inbox (quando aplicável) e envelope de evento são gravados em uma única transação. Um publisher usa `FOR UPDATE SKIP LOCKED`, envia à fila FIFO `integration-events.fifo` e marca `published_at` no banco. Se o processo cair depois do envio e antes do commit, a mensagem pode ser enviada novamente; `eventId` e deduplicação FIFO tornam esse retry seguro. Falhas usam backoff exponencial limitado a cinco minutos.
+Inbox evita que a mesma mensagem SQS seja processada duas vezes. A mensagem só é removida depois que a transação financeira termina.
 
-Comandos de aposta entram em `wager-transactions.fifo`; após cinco recebimentos sem ack, a política de redrive leva a mensagem à DLQ. Eventos publicados saem por outra fila para impedir que o consumidor leia os próprios eventos como comandos.
+Outbox salva o evento junto com a operação. Um worker busca eventos pendentes, envia para a fila de eventos e marca o registro como publicado. Se o processo cair no meio, o evento pode ser tentado novamente com segurança. Mensagens que falham repetidamente vão para a DLQ.
 
-## Eventos publicados
+Operações que dependem de uma referência ainda ausente ficam como `PENDING_REFERENCE`. O worker tenta novamente com intervalos crescentes e rejeita depois do limite.
 
-- `WagerTransactionProcessed` para transação processada, inclusive `LOSS`.
-- `WagerTransactionRejected` para rejeição de negócio.
-- `WagerTransactionPendingReference` quando a referência ainda não existe.
-- `WalletBalanceChanged` somente quando uma movimentação altera o saldo.
+## Pastas principais
 
-Os envelopes têm versão e carregam valores de `Money` como `{ amount, currency }`.
+- `src/domain`: regras puras do negócio.
+- `src/application`: casos de uso e interfaces.
+- `src/infra/database`: migrations e configuração do banco.
+- `src/infra/persistence`: adaptadores SQL.
+- `src/infra/http`: controllers e endpoints.
+- `src/infra/messaging`: consumidor SQS e publisher da outbox.
+- `src/infra/observability`: métricas e logs.
+- `test`: testes de integração e concorrência.
 
-## Autenticação e limites conhecidos
+## Limites conhecidos
 
-Autenticação ficou fora da implementação para priorizar as garantias financeiras do challenge. A API está sem guard por enquanto; o ponto de extensão é um `AuthGuard` NestJS ou `ProviderIdentityPort` alimentado por OIDC/IdP externo. Não deve ser criada autenticação artesanal com tabela de senha.
-
-`/metrics` expõe contadores locais do processo em formato Prometheus. Em múltiplas instâncias, cada processo precisa ser coletado; os valores não são uma fonte compartilhada de consistência. Logs de retry e reconciliação omitem payload e valores financeiros. A suíte usa PostgreSQL e LocalStack reais, mas recuperação após reinicialização com três processos externos ainda precisa de um cenário automatizado dedicado.
+Autenticação não foi implementada neste desafio. O ponto correto para adicioná-la é um `AuthGuard` do NestJS ligado a um Identity Provider externo. As métricas são locais ao processo e devem ser coletadas por um Prometheus em produção.
