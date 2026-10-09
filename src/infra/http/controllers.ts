@@ -32,6 +32,8 @@ import { PostgresTransactionContext } from '../persistence/postgres/postgres-tra
 import { PostgresWalletRepository } from '../persistence/postgres/postgres-wallet-repository';
 import { PostgresLedgerRepository } from '../persistence/postgres/postgres-ledger-repository';
 import { PostgresWagerTransactionRepository } from '../persistence/postgres/postgres-wager-transaction-repository';
+import type { ProviderIdentityPort } from '../../application/ports/provider-identity';
+import type { MetricsPort } from '../../application/ports/metrics';
 
 interface HttpStatusResponse {
   status(code: number): HttpStatusResponse;
@@ -103,6 +105,7 @@ export class WalletController {
   constructor(
     private readonly createWallet: CreateWallet,
     @Inject('ORM') private readonly orm: MikroORM,
+    @Inject('METRICS') private readonly metrics: MetricsPort,
   ) {}
 
   @Post()
@@ -209,6 +212,7 @@ export class WalletController {
     });
 
     if (!result.consistent) {
+      this.metrics.recordReconciliationMismatch();
       // Logamos só o identificador e a contagem; não despejamos valores financeiros no log.
       console.error(JSON.stringify({
         event: 'wallet_reconciliation_mismatch',
@@ -235,6 +239,7 @@ export class WagerTransactionController {
   constructor(
     private readonly processTransaction: ProcessWagerTransaction,
     @Inject('ORM') private readonly orm: MikroORM,
+    @Inject('PROVIDER_IDENTITY') private readonly providerIdentity: ProviderIdentityPort,
   ) {}
 
   @Post('wagering/transactions')
@@ -248,6 +253,7 @@ export class WagerTransactionController {
       throw new BadRequestException('Idempotency-Key header is required');
     }
     const business = transactionBody(body, idempotencyKey);
+    this.providerIdentity.assertAllowed(business.providerId);
     try {
       const result = await this.processTransaction.execute({
         ...business,
