@@ -78,6 +78,10 @@ export interface WagerTransactionState {
   referenceTransactionId?: string | undefined;
   failureCode?: FailureCode | undefined;
   processedAt?: Date | undefined;
+    // Saldo observado quando a operação foi processada; necessário para replay idempotente.
+  observedBalance?: Money | undefined;
+  referenceAttempts?: number;
+  nextReferenceCheckAt?: Date;
 }
 
 // Texto obrigatório: não pode ser vazio nem só espaços.
@@ -105,6 +109,7 @@ export class WagerTransaction {
   private _referenceTransactionId: string | undefined;
   private _failureCode: FailureCode | undefined;
   private _processedAt: Date | undefined;
+  private _observedBalance: Money | undefined;
 
   private constructor(state: WagerTransactionState) {
     this.id = state.id;
@@ -124,6 +129,7 @@ export class WagerTransaction {
     this._referenceTransactionId = state.referenceTransactionId;
     this._failureCode = state.failureCode;
     this._processedAt = state.processedAt;
+    this._observedBalance = state.observedBalance;
   }
 
   // Cria uma transação que veio de fora (API ou fila). Ela nasce em PENDING.
@@ -212,17 +218,37 @@ export class WagerTransaction {
     return this._processedAt;
   }
 
+  get observedBalance(): Money | undefined {
+    return this._observedBalance;
+  }
+
   // ---- transições de status
 
   // Marca como aplicada. REFUND e ROLLBACK precisam informar o id interno da referência.
-  markProcessed(referenceTransactionId: string | undefined, at: Date): void {
+  markProcessed(
+    referenceTransactionId: string | undefined,
+    at: Date,
+    observedBalance: Money,
+  ): void {
+    // Reversões precisam apontar para a transação interna que estão revertendo.
     if (this.requiresReference() && referenceTransactionId === undefined) {
-      throw new InvalidTransactionError('referenceTransactionId is required to process this kind');
+      throw new InvalidTransactionError(
+        'referenceTransactionId is required to process this kind',
+      );
+    }
+    if (observedBalance.currency !== this.money.currency) {
+      throw new InvalidTransactionError(
+        'observed balance currency must match transaction currency',
+      );
+    }
+    if (observedBalance.isNegative()) {
+      throw new InvalidTransactionError('observed balance cannot be negative');
     }
     this.assertCanMoveTo(Status.Processed);
     this._status = Status.Processed;
     this._referenceTransactionId = referenceTransactionId;
     this._processedAt = at;
+    this._observedBalance = observedBalance;
   }
 
   // Marca como "esperando a referência chegar". Só faz sentido se a transação aponta para uma referência.

@@ -9,6 +9,11 @@ const TEST_DATABASE_NAME = 'wager_test';
 
 export const uuid = (): string => crypto.randomUUID();
 
+// URL isolada que os processos filhos usam sem passar pelo reset de schema do createTestOrm.
+export function testDatabaseUrl(): string {
+  return urlFor(TEST_DATABASE_NAME);
+}
+
 // Monto a URL de um banco qualquer a partir do DATABASE_URL (troco só o nome do banco).
 function urlFor(databaseName: string): string {
   const url = new URL(process.env.DATABASE_URL ?? 'postgresql://wager:wager@localhost:5432/wager');

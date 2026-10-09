@@ -3,6 +3,7 @@ set -e
 
 DLQ_NAME="wager-transactions-dlq.fifo"
 QUEUE_NAME="wager-transactions.fifo"
+EVENTS_QUEUE_NAME="integration-events.fifo"
 
 awslocal sqs create-queue \
   --queue-name "$DLQ_NAME" \
@@ -21,6 +22,11 @@ EOF
 awslocal sqs create-queue \
   --queue-name "$QUEUE_NAME" \
   --attributes file:///tmp/main-attrs.json
+
+# Eventos publicados pela outbox não devem voltar para a fila de comandos de aposta.
+awslocal sqs create-queue \
+  --queue-name "$EVENTS_QUEUE_NAME" \
+  --attributes FifoQueue=true
 
 echo "Filas criadas:"
 awslocal sqs list-queues

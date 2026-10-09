@@ -41,7 +41,12 @@ const makeTx = (overrides: Partial<CreateWagerTransactionProps> = {}): WagerTran
 // Atalho: cria uma transação e já marca como PROCESSED (para servir de referência).
 const processed = (overrides: Partial<CreateWagerTransactionProps> = {}): WagerTransaction => {
   const tx = makeTx(overrides);
-  tx.markProcessed(tx.requiresReference() ? 'ref-internal' : undefined, AT);
+  // Estes testes usam saldo zero apenas para representar a resposta persistida no replay.
+  tx.markProcessed(
+    tx.requiresReference() ? 'ref-internal' : undefined,
+    AT,
+    Money.zero(tx.money.currency),
+  );
   return tx;
 };
 
@@ -154,7 +159,7 @@ describe('ledgerDirectionFor', () => {
 describe('transições de status', () => {
   it('PENDING -> PROCESSED', () => {
     const tx = makeTx();
-    tx.markProcessed(undefined, AT);
+    tx.markProcessed(undefined, AT, Money.zero(tx.money.currency));
     expect(tx.status).toBe(Status.Processed);
     expect(tx.processedAt).toEqual(AT);
     expect(tx.isTerminal()).toBe(true);
@@ -165,7 +170,7 @@ describe('transições de status', () => {
     tx.markPendingReference();
     expect(tx.status).toBe(Status.PendingReference);
     expect(tx.isTerminal()).toBe(false);
-    tx.markProcessed('internal-bet-id', AT);
+    tx.markProcessed('internal-bet-id', AT, Money.zero(tx.money.currency));
     expect(tx.status).toBe(Status.Processed);
     expect(tx.referenceTransactionId).toBe('internal-bet-id');
   });
@@ -191,7 +196,9 @@ describe('transições de status', () => {
 
   it('REFUND e ROLLBACK não podem ser marcados como processados sem a referência interna', () => {
     const tx = makeTx({ kind: Kind.Refund, referenceExternalTransactionId: 'bet-1' });
-    expect(() => tx.markProcessed(undefined, AT)).toThrow(InvalidTransactionError);
+    expect(() =>
+      tx.markProcessed(undefined, AT, Money.zero(tx.money.currency)),
+    ).toThrow(InvalidTransactionError);
     expect(tx.status).toBe(Status.Pending);
   });
 
@@ -229,7 +236,9 @@ describe('transições de status', () => {
     const tx = build();
     const statusBefore = tx.status;
     expect(tx.isTerminal()).toBe(true);
-    expect(() => tx.markProcessed(undefined, AT)).toThrow(InvalidTransactionStateError);
+    expect(() =>
+      tx.markProcessed(undefined, AT, Money.zero(tx.money.currency)),
+    ).toThrow(InvalidTransactionStateError);
     expect(() => tx.reject(FailureCode.InsufficientFunds)).toThrow(InvalidTransactionStateError);
     expect(() => tx.fail(FailureCode.InternalError)).toThrow(InvalidTransactionStateError);
     expect(tx.status).toBe(statusBefore);
