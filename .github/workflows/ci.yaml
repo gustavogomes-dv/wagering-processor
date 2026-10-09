@@ -24,8 +24,28 @@ jobs:
           --health-timeout 3s
           --health-retries 10
 
+      localstack:
+        image: localstack/localstack:3.8
+        env:
+          SERVICES: sqs
+          AWS_DEFAULT_REGION: us-east-1
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -fsS http://localhost:4566/_localstack/health || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
     env:
       DATABASE_URL: postgresql://wager:wager@localhost:5432/wager
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_ENDPOINT: http://localhost:4566
+      SQS_QUEUE_URL: http://localhost:4566/000000000000/wager-transactions.fifo
+      SQS_DLQ_URL: http://localhost:4566/000000000000/wager-transactions-dlq.fifo
+      SQS_EVENTS_QUEUE_URL: http://localhost:4566/000000000000/integration-events.fifo
 
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +53,20 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
+
+      - name: Create LocalStack queues
+        shell: bash
+        run: |
+          for queue in wager-transactions-dlq.fifo wager-transactions.fifo integration-events.fifo; do
+            curl -fsS -X POST "http://localhost:4566/" \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              --data-urlencode "Action=CreateQueue" \
+              --data-urlencode "QueueName=$queue" \
+              --data-urlencode 'Attribute.1.Name=FifoQueue' \
+              --data-urlencode 'Attribute.1.Value=true' \
+              --data-urlencode 'Version=2012-11-05' \
+              >/dev/null
+          done
 
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
