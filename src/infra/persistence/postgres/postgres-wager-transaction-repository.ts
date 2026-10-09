@@ -28,6 +28,8 @@ interface WagerTransactionRow {
   failure_code: FailureCode | null;
   processed_at: Date | null;
   observed_balance: string | null;
+  reference_attempts: number;
+  next_reference_check_at: Date | null;
 }
 
 /**
@@ -78,6 +80,68 @@ export class PostgresWagerTransactionRepository
     );
 
     return rows[0] === undefined ? undefined : this.toState(rows[0]);
+  }
+
+  async findProcessedReversal(
+    session: TransactionSession,
+    referenceTransactionId: string,
+    kind: WagerTransaction['kind'],
+  ): Promise<boolean> {
+    const rows = await session.execute<Array<{ id: string }>>(
+      `
+        select id
+          from wager_transactions
+         where reference_transaction_id = ?
+           and kind = ?
+           and status = 'PROCESSED'
+         limit 1
+      `,
+      [referenceTransactionId, kind],
+    );
+    return rows.length > 0;
+  }
+
+  async claimPendingReferences(
+    session: TransactionSession,
+    limit: number,
+    now: Date,
+    leaseUntil: Date,
+  ): Promise<WagerTransactionState[]> {
+    const rows = await session.execute<WagerTransactionRow[]>(
+      `
+        with due as (
+          select id
+            from wager_transactions
+           where status = 'PENDING_REFERENCE'
+             and (next_reference_check_at is null or next_reference_check_at <= ?)
+           order by coalesce(next_reference_check_at, created_at), id
+           limit ?
+           for update skip locked
+        )
+        update wager_transactions transaction
+           set reference_attempts = transaction.reference_attempts + 1,
+               next_reference_check_at = ?
+          from due
+         where transaction.id = due.id
+        returning transaction.*
+      `,
+      [now, limit, leaseUntil],
+    );
+    return rows.map((row) => this.toState(row));
+  }
+
+  async scheduleReferenceCheck(
+    session: TransactionSession,
+    transactionId: string,
+    attempts: number,
+    nextCheckAt: Date,
+  ): Promise<void> {
+    await session.execute(
+      `update wager_transactions
+          set reference_attempts = ?, next_reference_check_at = ?, updated_at = now()
+        where id = ? and status = 'PENDING_REFERENCE'`,
+      [attempts, nextCheckAt, transactionId],
+    );
   }
 
   async create(
@@ -141,6 +205,7 @@ export class PostgresWagerTransactionRepository
                failure_code = ?,
                processed_at = ?,
                updated_at = ?,
+               next_reference_check_at = null,
                -- Guardamos o saldo da resposta original para responder replay idempotente.
                observed_balance = ?
          where id = ?
@@ -183,7 +248,9 @@ export class PostgresWagerTransactionRepository
           status,
           failure_code,
           processed_at,
-          observed_balance
+          observed_balance,
+          reference_attempts,
+          next_reference_check_at
         from wager_transactions
         ${condition}
       `,
@@ -223,6 +290,10 @@ export class PostgresWagerTransactionRepository
             amount: String(row.observed_balance),
             currency: row.currency,
           })
+        : undefined,
+      referenceAttempts: Number(row.reference_attempts),
+      nextReferenceCheckAt: row.next_reference_check_at
+        ? new Date(row.next_reference_check_at)
         : undefined,
     };
   }

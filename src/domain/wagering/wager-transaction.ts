@@ -80,6 +80,8 @@ export interface WagerTransactionState {
   processedAt?: Date | undefined;
     // Saldo observado quando a operação foi processada; necessário para replay idempotente.
   observedBalance?: Money | undefined;
+  referenceAttempts?: number;
+  nextReferenceCheckAt?: Date;
 }
 
 // Texto obrigatório: não pode ser vazio nem só espaços.

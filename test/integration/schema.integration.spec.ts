@@ -1,11 +1,20 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
+import { SQSClient } from '@aws-sdk/client-sqs';
 import { FailureCode } from '../../src/domain/wagering/failure-code';
 import { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../../src/domain/wagering/wager-transaction';
 import { PostgresWalletRepository } from '../../src/infra/persistence/postgres/postgres-wallet-repository';
 import { PostgresWagerTransactionRepository } from '../../src/infra/persistence/postgres/postgres-wager-transaction-repository';
 import { PostgresLedgerRepository } from '../../src/infra/persistence/postgres/postgres-ledger-repository';
 import type { TransactionSession } from '../../src/application/ports/transaction-context';
+import { IdempotencyConflictError, ProcessWagerTransaction } from '../../src/application/use-cases/process-wager-transaction';
+import { CreateWallet } from '../../src/application/use-cases/create-wallet';
+import { InboxPayloadConflictError } from '../../src/application/ports/inbox-repository';
+import { PostgresTransactionContext } from '../../src/infra/persistence/postgres/postgres-transaction-context';
+import { PostgresOutboxRepository } from '../../src/infra/persistence/postgres/postgres-outbox-repository';
+import { PostgresInboxRepository } from '../../src/infra/persistence/postgres/postgres-inbox-repository';
+import { PendingReferenceWorker } from '../../src/infra/messaging/pending-reference.worker';
+import { OutboxPublisherWorker } from '../../src/infra/messaging/outbox-publisher.worker';
 import { Money } from '../../src/domain/shared/money';
 import { LedgerDirection } from '../../src/domain/wallet/ledger-direction';
 import { Wallet } from '../../src/domain/wallet/wallet';
@@ -16,17 +25,28 @@ import {
   insertTransaction,
   markProcessed,
   moveFunds,
+  testDatabaseUrl,
   uuid,
   walletMatchesLedger,
 } from '../support/test-database';
 
 let orm: MikroORM;
+let sqs: SQSClient;
 
 beforeAll(async () => {
   orm = await createTestOrm();
+  sqs = new SQSClient({
+    region: process.env.AWS_REGION ?? 'us-east-1',
+    ...(process.env.SQS_ENDPOINT === undefined ? {} : { endpoint: process.env.SQS_ENDPOINT }),
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? 'test',
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? 'test',
+    },
+  });
 });
 
 afterAll(async () => {
+  sqs.destroy();
   await orm.close();
 });
 
@@ -782,6 +802,60 @@ describe('outbox_messages', () => {
     expect(all.length).toBe(3);
     expect(new Set(all).size).toBe(3);
   });
+
+  it('publisher envia evento FIFO ao LocalStack e só depois marca como publicado', async () => {
+    const id = uuid();
+    await db().execute(
+      `insert into outbox_messages (id, aggregate_id, event_type, payload, occurred_at, created_at)
+       values (?, ?, 'IntegrationTestEvent', ?::jsonb, now(), now())`,
+      [id, `integration-${id}`, JSON.stringify({ eventId: id, eventType: 'IntegrationTestEvent' })],
+    );
+    const worker = new OutboxPublisherWorker(
+      { run: (work) => new PostgresTransactionContext(db()).run(work) },
+      new PostgresOutboxRepository(),
+      sqs,
+    );
+
+    const result = await worker.runOnce();
+    const [row] = await db().execute('select published_at from outbox_messages where id = ?', [id]);
+
+    expect(result.published).toBeGreaterThanOrEqual(1);
+    expect(row?.published_at).toBeDefined();
+  });
+
+  it('falha de publicação incrementa tentativas e agenda backoff no banco', async () => {
+    const id = uuid();
+    await db().execute(
+      `insert into outbox_messages (id, aggregate_id, event_type, payload, occurred_at, created_at)
+       values (?, ?, 'RetryTestEvent', ?::jsonb, now(), now())`,
+      [id, `retry-${id}`, JSON.stringify({ eventId: id })],
+    );
+    const unavailableSqs = new SQSClient({
+      region: 'us-east-1',
+      endpoint: 'http://127.0.0.1:1',
+      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+      maxAttempts: 1,
+    });
+    try {
+      const worker = new OutboxPublisherWorker(
+        { run: (work) => new PostgresTransactionContext(db()).run(work) },
+        new PostgresOutboxRepository(),
+        unavailableSqs,
+      );
+
+      const result = await worker.runOnce();
+      const [row] = await db().execute(
+        `select attempts, next_attempt_at from outbox_messages where id = ?`,
+        [id],
+      );
+
+      expect(result.retried).toBeGreaterThanOrEqual(1);
+      expect(Number(row?.attempts)).toBe(1);
+      expect(row?.next_attempt_at).toBeDefined();
+    } finally {
+      unavailableSqs.destroy();
+    }
+  });
 });
 
 describe('PostgresWalletRepository', () => {
@@ -914,5 +988,331 @@ describe('PostgresLedgerRepository', () => {
     expect(firstPage[0]?.walletVersion).toBe(2);
     expect(nextPage[0]?.walletVersion).toBe(1);
     expect(openingEntry?.entry.balanceAfter.toString()).toBe('100.00');
+  });
+});
+
+describe('ProcessWagerTransaction', () => {
+  const createUseCase = () => new ProcessWagerTransaction({
+    // Um EntityManager por chamada faz Promise.all disputar locks usando conexões distintas.
+    transactionContext: {
+      run: <T>(work: (transactionSession: TransactionSession) => Promise<T>) =>
+        new PostgresTransactionContext(db()).run(work),
+    },
+    walletRepository: (transactionSession) => new PostgresWalletRepository(transactionSession),
+    wagerTransactionRepository: new PostgresWagerTransactionRepository(),
+    ledgerRepository: new PostgresLedgerRepository(),
+    outboxRepository: new PostgresOutboxRepository(),
+    inboxRepository: new PostgresInboxRepository(),
+  });
+
+  const bet = (walletId: string, playerId: string, suffix: string) => ({
+    providerId: 'processor-test',
+    externalTransactionId: `bet-${suffix}`,
+    idempotencyKey: `processor-test:bet-${suffix}`,
+    payloadHash: `hash-${suffix}`,
+    walletId,
+    playerId,
+    roundId: 'round-processor',
+    gameId: 'game-processor',
+    kind: WagerTransactionKind.Bet,
+    money: Money.from({ amount: '80.00', currency: 'BRL' }),
+  });
+
+  it('serializa duas apostas concorrentes e só permite um débito', async () => {
+    const wallet = await createWallet(orm, { balance: '100.00' });
+    const processor = createUseCase();
+
+    const [first, second] = await Promise.all([
+      processor.execute(bet(wallet.id, wallet.playerId, 'parallel-a')),
+      processor.execute(bet(wallet.id, wallet.playerId, 'parallel-b')),
+    ]);
+    const storedWallet = await wallets(wallet.id);
+    const transactions = await db().execute(
+      `select status, failure_code from wager_transactions
+        where wallet_id = ? and external_transaction_id like 'bet-parallel-%'`,
+      [wallet.id],
+    );
+    const entries = await db().execute(
+      `select id from wallet_ledger_entries where wallet_id = ? and direction = 'DEBIT'`,
+      [wallet.id],
+    );
+    const events = await db().execute(
+      `select id, event_type from outbox_messages where aggregate_id in
+        (select id::text from wager_transactions where wallet_id = ? and external_transaction_id like 'bet-parallel-%')`,
+      [wallet.id],
+    );
+
+    expect([first.status, second.status].filter((status) => status === WagerTransactionStatus.Processed)).toHaveLength(1);
+    expect([first.status, second.status].filter((status) => status === WagerTransactionStatus.Rejected)).toHaveLength(1);
+    expect(transactions.find((row) => row.status === WagerTransactionStatus.Rejected)?.failure_code).toBe(
+      FailureCode.InsufficientFunds,
+    );
+    expect(storedWallet.balance).toBe('20.00');
+    expect(entries).toHaveLength(1);
+    expect(events).toHaveLength(3);
+    expect(new Set(events.map((event) => event.id)).size).toBe(3);
+    expect(events.map((event) => event.event_type)).toContain('WagerTransactionRejected');
+    expect(events.map((event) => event.event_type)).toContain('WagerTransactionProcessed');
+    expect(events.map((event) => event.event_type)).toContain('WalletBalanceChanged');
+  });
+
+  it('50 redeliveries paralelas com a mesma chave geram um único débito', async () => {
+    const wallet = await createWallet(orm, { balance: '100.00' });
+    const request = bet(wallet.id, wallet.playerId, 'fifty-retries');
+    const results = await Promise.all(
+      Array.from({ length: 50 }, () => createUseCase().execute(request)),
+    );
+    const ledger = await db().execute(
+      `select id from wallet_ledger_entries where wallet_id = ? and direction = 'DEBIT'`,
+      [wallet.id],
+    );
+
+    expect(new Set(results.map((result) => result.transactionId)).size).toBe(1);
+    expect(results.filter((result) => !result.idempotentReplay)).toHaveLength(1);
+    expect((await wallets(wallet.id)).balance).toBe('20.00');
+    expect(ledger).toHaveLength(1);
+  });
+
+  it('três processos independentes disputam a mesma wallet sem duplicar o débito', async () => {
+    const wallet = await createWallet(orm, { balance: '100.00' });
+    const request = bet(wallet.id, wallet.playerId, 'three-processes');
+    const script = `${process.cwd()}/test/support/process-wager-child.ts`;
+    const children = Array.from({ length: 3 }, () =>
+      Bun.spawn([process.execPath, 'run', script], {
+        env: {
+          DATABASE_URL: testDatabaseUrl(),
+          WAGER_INPUT: JSON.stringify(request),
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }),
+    );
+    const results = await Promise.all(children.map(async (child) => {
+      const [exitCode, output, errorOutput] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      if (exitCode !== 0) throw new Error(`Child process failed: ${errorOutput}`);
+      return JSON.parse(output.trim().split(/\r?\n/).at(-1)!) as {
+        transactionId: string;
+        idempotentReplay: boolean;
+      };
+    }));
+    const ledger = await db().execute(
+      `select id from wallet_ledger_entries where wallet_id = ? and direction = 'DEBIT'`,
+      [wallet.id],
+    );
+
+    expect(new Set(results.map((result) => result.transactionId)).size).toBe(1);
+    expect(results.filter((result) => !result.idempotentReplay)).toHaveLength(1);
+    expect((await wallets(wallet.id)).balance).toBe('20.00');
+    expect(ledger).toHaveLength(1);
+  });
+
+  it('mesma chave retorna o resultado original e não repete o débito', async () => {
+    const wallet = await createWallet(orm, { balance: '100.00' });
+    const processor = createUseCase();
+    const request = bet(wallet.id, wallet.playerId, 'replay');
+
+    const first = await processor.execute(request);
+    const replay = await processor.execute(request);
+
+    expect(first.status).toBe(WagerTransactionStatus.Processed);
+    expect(replay.idempotentReplay).toBe(true);
+    expect(replay.transactionId).toBe(first.transactionId);
+    expect(replay.balance?.toString()).toBe(first.balance?.toString());
+    expect((await wallets(wallet.id)).balance).toBe('20.00');
+    const outbox = await db().execute(
+      `select id from outbox_messages where aggregate_id = ?`,
+      [first.transactionId],
+    );
+    expect(outbox).toHaveLength(2);
+
+    await expect(
+      processor.execute({ ...request, payloadHash: 'different-business-payload' }),
+    ).rejects.toBeInstanceOf(IdempotencyConflictError);
+  });
+
+  it('processa uma única REFUND por BET e audita a tentativa duplicada', async () => {
+    const wallet = await createWallet(orm, { balance: '100.00' });
+    const processor = createUseCase();
+    const originalBet = bet(wallet.id, wallet.playerId, 'to-refund');
+    const betResult = await processor.execute(originalBet);
+    const refundInput = {
+      ...bet(wallet.id, wallet.playerId, 'refund-a'),
+      kind: WagerTransactionKind.Refund,
+      referenceExternalTransactionId: originalBet.externalTransactionId,
+    };
+    const refund = await processor.execute(refundInput);
+    const duplicateRefund = await processor.execute({
+      ...refundInput,
+      externalTransactionId: 'refund-duplicate',
+      idempotencyKey: 'processor-test:refund-duplicate',
+      payloadHash: 'hash-refund-duplicate',
+    });
+
+    expect(betResult.status).toBe(WagerTransactionStatus.Processed);
+    expect(refund.status).toBe(WagerTransactionStatus.Processed);
+    expect(duplicateRefund.status).toBe(WagerTransactionStatus.Rejected);
+    expect(duplicateRefund.failureCode).toBe(FailureCode.AlreadyReversed);
+    expect((await wallets(wallet.id)).balance).toBe('100.00');
+    const ledger = await db().execute(
+      `select id from wallet_ledger_entries where wallet_id = ?`,
+      [wallet.id],
+    );
+    expect(ledger).toHaveLength(3); // OPENING, BET e apenas uma REFUND
+  });
+
+  it('registra LOSS como processada sem alterar saldo ou criar ledger', async () => {
+    const wallet = await createWallet(orm, { balance: '35.00' });
+    const processor = createUseCase();
+    const loss = await processor.execute({
+      ...bet(wallet.id, wallet.playerId, 'loss'),
+      kind: WagerTransactionKind.Loss,
+      money: Money.zero('BRL'),
+    });
+
+    expect(loss.status).toBe(WagerTransactionStatus.Processed);
+    expect(loss.balance?.toString()).toBe('35.00');
+    expect((await wallets(wallet.id)).balance).toBe('35.00');
+    const events = await db().execute('select event_type from outbox_messages where aggregate_id = ?', [loss.transactionId]);
+    expect(events.map((event) => event.event_type)).toEqual(['WagerTransactionProcessed']);
+    const transactionLedger = await db().execute(
+      'select id from wallet_ledger_entries where transaction_id = ?',
+      [loss.transactionId],
+    );
+    expect(transactionLedger).toHaveLength(0);
+  });
+
+  it('guarda operação dependente em PENDING_REFERENCE e coloca evento na outbox', async () => {
+    const wallet = await createWallet(orm, { balance: '35.00' });
+    const processor = createUseCase();
+    const pending = await processor.execute({
+      ...bet(wallet.id, wallet.playerId, 'waiting-refund'),
+      kind: WagerTransactionKind.Refund,
+      referenceExternalTransactionId: 'not-arrived-yet',
+    });
+
+    expect(pending.status).toBe(WagerTransactionStatus.PendingReference);
+    expect((await wallets(wallet.id)).balance).toBe('35.00');
+    const events = await db().execute('select event_type from outbox_messages where aggregate_id = ?', [pending.transactionId]);
+    expect(events.map((event) => event.event_type)).toEqual(['WagerTransactionPendingReference']);
+  });
+
+  it('deduplica mensagem SQS pela inbox na mesma transação da aposta', async () => {
+    const wallet = await createWallet(orm, { balance: '100.00' });
+    const processor = createUseCase();
+    const message = { consumerName: 'integration-consumer', messageId: `msg-${uuid()}` };
+    const request = {
+      ...bet(wallet.id, wallet.playerId, 'inbox'),
+      inboxMessage: message,
+    };
+
+    const first = await processor.execute(request);
+    const duplicate = await processor.execute(request);
+    const [inbox] = await db().execute(
+      `select processed_at from inbox_messages where consumer_name = ? and message_id = ?`,
+      [message.consumerName, message.messageId],
+    );
+
+    expect(first.status).toBe(WagerTransactionStatus.Processed);
+    expect(duplicate.duplicateDelivery).toBe(true);
+    expect(inbox?.processed_at).toBeDefined();
+    expect((await wallets(wallet.id)).balance).toBe('20.00');
+
+    await expect(
+      processor.execute({ ...request, payloadHash: 'different-message-content' }),
+    ).rejects.toBeInstanceOf(InboxPayloadConflictError);
+  });
+
+  it('worker reprocessa referência fora de ordem quando a BET chega', async () => {
+    const wallet = await createWallet(orm, { balance: '100.00' });
+    const processor = createUseCase();
+    const refund = await processor.execute({
+      ...bet(wallet.id, wallet.playerId, 'out-of-order-refund'),
+      kind: WagerTransactionKind.Refund,
+      referenceExternalTransactionId: 'late-reference-bet',
+    });
+    expect(refund.status).toBe(WagerTransactionStatus.PendingReference);
+
+    await processor.execute({
+      ...bet(wallet.id, wallet.playerId, 'late-bet'),
+      externalTransactionId: 'late-reference-bet',
+    });
+    await db().execute(
+      `update wager_transactions set next_reference_check_at = now() - interval '1 second' where id = ?`,
+      [refund.transactionId],
+    );
+    const worker = new PendingReferenceWorker(orm, processor);
+
+    expect(await worker.runOnce()).toBeGreaterThanOrEqual(1);
+    const transaction = await new PostgresTransactionContext(db()).run((transactionSession) =>
+      new PostgresWagerTransactionRepository().findById(transactionSession, refund.transactionId),
+    );
+
+    expect(transaction?.status).toBe(WagerTransactionStatus.Processed);
+    expect(transaction?.referenceTransactionId).toBeDefined();
+    expect((await wallets(wallet.id)).balance).toBe('100.00');
+  });
+});
+
+describe('CreateWallet', () => {
+  const createUseCase = () => new CreateWallet({
+    transactionContext: {
+      run: <T>(work: (transactionSession: TransactionSession) => Promise<T>) =>
+        new PostgresTransactionContext(db()).run(work),
+    },
+    walletRepository: (transactionSession) => new PostgresWalletRepository(transactionSession),
+    wagerTransactionRepository: new PostgresWagerTransactionRepository(),
+    ledgerRepository: new PostgresLedgerRepository(),
+    outboxRepository: new PostgresOutboxRepository(),
+  });
+
+  it('cria saldo inicial com OPENING, ledger e eventos na mesma transação', async () => {
+    const result = await createUseCase().execute({
+      playerId: `opening-player-${uuid()}`,
+      initialBalance: Money.from({ amount: '250.00', currency: 'BRL' }),
+    });
+    const opening = await db().execute(
+      `select id, status, observed_balance from wager_transactions where wallet_id = ? and kind = 'OPENING'`,
+      [result.id],
+    );
+    const ledger = await db().execute(
+      `select direction, wallet_version, balance_before, balance_after
+         from wallet_ledger_entries where wallet_id = ?`,
+      [result.id],
+    );
+    const events = await db().execute(
+      `select event_type from outbox_messages where aggregate_id = ?`,
+      [opening[0]?.id as string],
+    );
+
+    expect(result.balance.toString()).toBe('250.00');
+    expect(result.version).toBe(1);
+    expect(opening[0]?.status).toBe(WagerTransactionStatus.Processed);
+    expect(String(opening[0]?.observed_balance)).toBe('250.00');
+    expect(ledger[0]).toEqual({
+      direction: LedgerDirection.Credit,
+      wallet_version: 1,
+      balance_before: '0.00',
+      balance_after: '250.00',
+    });
+    expect(events.map((event) => event.event_type)).toEqual([
+      'WagerTransactionProcessed',
+      'WalletBalanceChanged',
+    ]);
+  });
+
+  it('cria wallet zerada sem inventar transação ou lançamento', async () => {
+    const result = await createUseCase().execute({
+      playerId: `empty-player-${uuid()}`,
+      initialBalance: Money.zero('BRL'),
+    });
+
+    expect(result.balance.toString()).toBe('0.00');
+    expect(result.version).toBe(1);
+    expect(await db().execute('select id from wager_transactions where wallet_id = ?', [result.id])).toHaveLength(0);
+    expect(await db().execute('select id from wallet_ledger_entries where wallet_id = ?', [result.id])).toHaveLength(0);
   });
 });

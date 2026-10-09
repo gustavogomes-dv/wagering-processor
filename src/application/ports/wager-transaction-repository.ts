@@ -23,6 +23,26 @@ export interface WagerTransactionRepository {
     externalTransactionId: string,
   ): Promise<WagerTransactionState | undefined>;
 
+  findProcessedReversal(
+    session: TransactionSession,
+    referenceTransactionId: string,
+    kind: WagerTransaction['kind'],
+  ): Promise<boolean>;
+
+  claimPendingReferences(
+    session: TransactionSession,
+    limit: number,
+    now: Date,
+    leaseUntil: Date,
+  ): Promise<WagerTransactionState[]>;
+
+  scheduleReferenceCheck(
+    session: TransactionSession,
+    transactionId: string,
+    attempts: number,
+    nextCheckAt: Date,
+  ): Promise<void>;
+
   create(
     session: TransactionSession,
     transaction: WagerTransaction,

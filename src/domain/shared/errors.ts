@@ -83,3 +83,11 @@ export class InvalidTransactionStateError extends DomainError {
     super(`Invalid transaction transition from ${from} to ${to}`);
   }
 }
+
+export class WalletNotFoundError extends DomainError {
+  readonly code = 'WALLET_NOT_FOUND';
+
+  constructor() {
+    super('Wallet was not found');
+  }
+}
