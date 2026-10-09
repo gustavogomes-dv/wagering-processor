@@ -1,7 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { FailureCode } from '../../src/domain/wagering/failure-code';
-import { WagerTransactionKind, WagerTransactionStatus } from '../../src/domain/wagering/wager-transaction';
+import { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../../src/domain/wagering/wager-transaction';
+import { PostgresWalletRepository } from '../../src/infra/persistence/postgres/postgres-wallet-repository';
+import { PostgresWagerTransactionRepository } from '../../src/infra/persistence/postgres/postgres-wager-transaction-repository';
+import { PostgresLedgerRepository } from '../../src/infra/persistence/postgres/postgres-ledger-repository';
+import type { TransactionSession } from '../../src/application/ports/transaction-context';
+import { Money } from '../../src/domain/shared/money';
+import { LedgerDirection } from '../../src/domain/wallet/ledger-direction';
+import { Wallet } from '../../src/domain/wallet/wallet';
 import {
   createTestOrm,
   createWallet,
@@ -25,6 +32,14 @@ afterAll(async () => {
 
 // Cada comando usa um EntityManager novo para um teste não atrapalhar o outro.
 const db = () => orm.em.fork();
+
+// Adapta o EntityManager de teste ao contrato SQL usado pelos repositórios.
+const session: TransactionSession = {
+  execute: async <T = unknown>(sql: string, parameters?: readonly unknown[]): Promise<T> => {
+    const result = await db().execute(sql, parameters ? [...parameters] : []);
+    return result as unknown as T;
+  },
+};
 
 const wallets = async (id: string) => {
   const [row] = await db().execute('select balance, version from wallets where id = ?', [id]);
@@ -766,5 +781,138 @@ describe('outbox_messages', () => {
     const all = claimed.flat();
     expect(all.length).toBe(3);
     expect(new Set(all).size).toBe(3);
+  });
+});
+
+describe('PostgresWalletRepository', () => {
+  it('cria e reidrata uma wallet como estado de domínio', async () => {
+    const repository = new PostgresWalletRepository(session);
+    const now = new Date();
+
+    const wallet = Wallet.open({
+      id: uuid(),
+      playerId: `repository-player-${uuid()}`,
+      // A criação isolada da wallet começa em zero.
+      // Saldo inicial positivo será tratado pelo use case junto com OPENING e ledger.
+      initialBalance: Money.zero('BRL'),
+      createdAt: now,
+    });
+
+    await repository.create(wallet);
+
+    const state = await repository.findById(wallet.id);
+
+    expect(state).toBeDefined();
+    expect(state?.id).toBe(wallet.id);
+    expect(state?.playerId).toBe(wallet.playerId);
+    expect(state?.balance.toString()).toBe('0.00');
+    expect(state?.version).toBe(1);
+  });
+
+  it('encontra uma wallet por jogador e moeda', async () => {
+    const repository = new PostgresWalletRepository(session);
+    const now = new Date();
+    const playerId = `repository-player-${uuid()}`;
+
+    const wallet = Wallet.open({
+      id: uuid(),
+      playerId,
+      initialBalance: Money.zero('USD'),
+      createdAt: now,
+    });
+
+    await repository.create(wallet);
+
+    const state = await repository.findByPlayerAndCurrency(
+      playerId,
+      'USD',
+    );
+
+    expect(state?.id).toBe(wallet.id);
+    expect(state?.currency).toBe('USD');
+  });
+
+  it('não atualiza saldo quando a versão esperada está desatualizada', async () => {
+    const wallet = await createWallet(orm);
+    const repository = new PostgresWalletRepository(session);
+
+    await expect(
+      repository.updateBalance(wallet.id, 0, Money.from({ amount: '5.00', currency: 'BRL' }), new Date()),
+    ).rejects.toThrow(/changed by another transaction/);
+  });
+});
+
+describe('PostgresWagerTransactionRepository', () => {
+  it('persiste e consulta por id, idempotência e identificador externo', async () => {
+    const wallet = await createWallet(orm);
+    const repository = new PostgresWagerTransactionRepository();
+    const id = uuid();
+    const externalId = `external-${id}`;
+    const tx = WagerTransaction.create({
+      id,
+      providerId: 'repository-provider',
+      externalTransactionId: externalId,
+      idempotencyKey: `key-${id}`,
+      payloadHash: 'payload-hash',
+      walletId: wallet.id,
+      playerId: wallet.playerId,
+      roundId: 'round-repository',
+      gameId: 'game-repository',
+      kind: WagerTransactionKind.Bet,
+      money: Money.from({ amount: '12.50', currency: wallet.currency }),
+      createdAt: new Date(),
+    });
+
+    await repository.create(session, tx);
+
+    expect((await repository.findById(session, id))?.id).toBe(id);
+    expect((await repository.findByIdempotencyKey(session, tx.idempotencyKey))?.id).toBe(id);
+    expect((await repository.findByProviderExternalId(session, tx.providerId, externalId))?.id).toBe(id);
+  });
+
+  it('reidrata o saldo observado gravado na transação OPENING', async () => {
+    const wallet = await createWallet(orm, { balance: '80.00' });
+    const [row] = await db().execute(
+      `select id from wager_transactions where wallet_id = ? and kind = 'OPENING'`,
+      [wallet.id],
+    );
+    if (row === undefined) throw new Error('OPENING transaction was not created');
+    const repository = new PostgresWagerTransactionRepository();
+
+    const state = await repository.findById(session, row.id as string);
+
+    expect(state?.status).toBe(WagerTransactionStatus.Processed);
+    expect(state?.observedBalance?.toString()).toBe('80.00');
+  });
+});
+
+describe('PostgresLedgerRepository', () => {
+  it('reidrata o lançamento e pagina usando a versão da wallet', async () => {
+    const wallet = await createWallet(orm, { balance: '100.00' });
+    const opening = await db().execute(
+      `select transaction_id from wallet_ledger_entries where wallet_id = ?`,
+      [wallet.id],
+    );
+    if (opening[0] === undefined) throw new Error('OPENING ledger entry was not created');
+    await moveFunds(orm, wallet.id, { kind: 'BET', direction: 'DEBIT', amount: '10.00' });
+    const repository = new PostgresLedgerRepository();
+
+    const firstPage = await repository.listByWallet(session, wallet.id, 1);
+    const nextPage = await repository.listByWallet(
+      session,
+      wallet.id,
+      1,
+      firstPage[0]?.walletVersion,
+    );
+    const openingEntry = await repository.findByTransactionId(
+      session,
+      opening[0].transaction_id as string,
+    );
+
+    expect(firstPage).toHaveLength(1);
+    expect(firstPage[0]?.entry.direction).toBe(LedgerDirection.Debit);
+    expect(firstPage[0]?.walletVersion).toBe(2);
+    expect(nextPage[0]?.walletVersion).toBe(1);
+    expect(openingEntry?.entry.balanceAfter.toString()).toBe('100.00');
   });
 });
