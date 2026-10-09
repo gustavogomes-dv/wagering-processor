@@ -54,4 +54,4 @@ Os testes de integração usam PostgreSQL e LocalStack reais. Os containers prec
 
 ## Autenticação
 
-A autenticação ficou fora do escopo do timebox. Em produção, a identidade do provedor deve ser validada por um Identity Provider e um guard do NestJS.
+A autenticação ficou fora do escopo do timebox. A decisão está detalhada em [ARCHITECTURE.md](ARCHITECTURE.md). Em produção, a identidade do provedor deve ser validada por um Identity Provider e um guard do NestJS.
