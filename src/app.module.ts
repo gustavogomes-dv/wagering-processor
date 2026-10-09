@@ -21,6 +21,7 @@ import { PendingReferenceWorker } from './infra/messaging/pending-reference.work
 import type { TransactionSession } from './application/ports/transaction-context';
 import { WageringMetrics } from './infra/observability/wagering-metrics';
 import { MetricsController } from './infra/http/metrics.controller';
+import { AllowAllProviderIdentity } from './application/ports/provider-identity';
 
 function createSqsClient(): SQSClient {
   const endpoint = process.env.SQS_ENDPOINT;
@@ -41,6 +42,7 @@ function createSqsClient(): SQSClient {
     { provide: 'ORM', useFactory: () => MikroORM.init(buildOrmConfig()) },
     { provide: 'SQS', useFactory: createSqsClient },
     { provide: 'METRICS', useClass: WageringMetrics },
+    { provide: 'PROVIDER_IDENTITY', useClass: AllowAllProviderIdentity },
     {
       provide: 'OUTBOX_CONTEXT',
       inject: ['ORM'],

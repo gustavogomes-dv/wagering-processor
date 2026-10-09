@@ -44,6 +44,10 @@ export class WageringMetrics implements MetricsPort {
     this.outboxLagSeconds = Math.max(0, seconds);
   }
 
+  recordReconciliationMismatch(): void {
+    this.increment('wagering_reconciliation_mismatches_total');
+  }
+
   toPrometheusText(): string {
     const lines = [
       '# HELP wagering_transactions_total Terminal and pending transaction outcomes.',
@@ -65,6 +69,9 @@ export class WageringMetrics implements MetricsPort {
       '# HELP wagering_outbox_lag_seconds Age of the oldest unpublished event.',
       '# TYPE wagering_outbox_lag_seconds gauge',
       `wagering_outbox_lag_seconds ${this.outboxLagSeconds.toFixed(3)}`,
+      '# HELP wagering_reconciliation_mismatches_total Wallet reconciliation mismatches.',
+      '# TYPE wagering_reconciliation_mismatches_total counter',
+      `wagering_reconciliation_mismatches_total ${this.get('wagering_reconciliation_mismatches_total')}`,
       '# HELP wagering_processing_latency_ms_sum Total transaction-processing latency.',
       '# TYPE wagering_processing_latency_ms_sum counter',
       `wagering_processing_latency_ms_sum ${this.processingLatencyTotalMs}`,

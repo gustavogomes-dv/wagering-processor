@@ -9,4 +9,5 @@ export interface MetricsPort {
   recordLockConflict(): void;
   recordProcessingLatency(milliseconds: number): void;
   setOutboxLag(seconds: number): void;
+  recordReconciliationMismatch(): void;
 }
